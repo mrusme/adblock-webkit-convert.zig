@@ -1,0 +1,214 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{matrix.os}}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - run: zig build test
+      - run: zig fmt --check .
+        if: matrix.os == 'ubuntu-latest'
+
+  package:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      hash: ${{ steps.fetch.outputs.hash }}
+      url: ${{ steps.fetch.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Check manifest version against tag
+        run: |
+          set -euo pipefail
+          zig build
+          reported=$(./zig-out/bin/adblock-webkit-convert --version)
+          expected="adblock-webkit-convert ${GITHUB_REF_NAME#v}"
+          if [ "$reported" != "$expected" ]; then
+            echo "build.zig.zon says '$reported', the tag says '$expected'." >&2
+            echo "Set .version in build.zig.zon to ${GITHUB_REF_NAME#v} and tag again." >&2
+            exit 1
+          fi
+          echo "$reported"
+
+      - name: Compute package hash
+        id: fetch
+        env:
+          SERVER: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          url="${SERVER}/${REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+          hash=$(zig fetch "$url")
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
+          echo "$hash"
+
+      - name: Build consumer
+        env:
+          URL: ${{ steps.fetch.outputs.url }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/consumer"
+          cd "$RUNNER_TEMP/consumer"
+          zig init
+          zig fetch --save=adblock_webkit_convert "$URL"
+
+          cat > build.zig <<'ZIG'
+          const std = @import("std");
+
+          pub fn build(b: *std.Build) void {
+              const target = b.standardTargetOptions(.{});
+              const optimize = b.standardOptimizeOption(.{});
+              const dep = b.dependency("adblock_webkit_convert", .{
+                  .target = target,
+                  .optimize = optimize,
+              });
+              const module = b.createModule(.{
+                  .root_source_file = b.path("src/main.zig"),
+                  .target = target,
+                  .optimize = optimize,
+              });
+              module.addImport("adblock_webkit_convert", dep.module("adblock_webkit_convert"));
+              b.installArtifact(b.addExecutable(.{ .name = "consumer", .root_module = module }));
+          }
+          ZIG
+
+          cat > src/main.zig <<'ZIG'
+          const std = @import("std");
+          const adblock = @import("adblock_webkit_convert");
+
+          pub fn main(init: std.process.Init) !u8 {
+              var report = try adblock.convertOne(init.gpa, init.io, .{
+                  .source = .{ .buffer = "||ads.example.com^\n" },
+                  .target = .buffer,
+              }, .{});
+              defer report.deinit();
+
+              const result = report.results[0];
+              if (result.outcome != .converted) return 1;
+              if (result.stats.rules != 2) return 1;
+              return 0;
+          }
+          ZIG
+
+          zig build
+          ./zig-out/bin/consumer
+
+  build:
+    needs: package
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-linux-gnu
+          - x86_64-linux-musl
+          - aarch64-linux-gnu
+          - aarch64-linux-musl
+          - riscv64-linux-gnu
+          - x86_64-macos
+          - aarch64-macos
+          - x86_64-windows-gnu
+          - aarch64-windows-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: zig build -Dtarget="$TARGET" -Dstrip -Doptimize=ReleaseSafe --prefix dist
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          name="adblock-webkit-convert-${GITHUB_REF_NAME}-${TARGET}"
+          case "$TARGET" in
+            *-windows-*) binary="adblock-webkit-convert.exe" ;;
+            *)           binary="adblock-webkit-convert" ;;
+          esac
+          install -Dm755 "dist/bin/$binary" "$name/$binary"
+          install -Dm644 README.md "$name/README.md"
+          install -Dm644 LICENSE "$name/LICENSE"
+          case "$TARGET" in
+            *-windows-*) zip -qr "$name.zip" "$name" ;;
+            *)           tar -czf "$name.tar.gz" "$name" ;;
+          esac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            *.tar.gz
+            *.zip
+          retention-days: 7
+
+  release:
+    needs: [package, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum * > SHA256SUMS
+      - name: Notes
+        env:
+          URL: ${{ needs.package.outputs.url }}
+          HASH: ${{ needs.package.outputs.hash }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          ## Use as a library
+
+          \`\`\`sh
+          zig fetch --save $URL
+          \`\`\`
+
+          Or in \`build.zig.zon\`:
+
+          \`\`\`zig
+          .adblock_webkit_convert = .{
+              .url = "$URL",
+              .hash = "$HASH",
+          },
+          \`\`\`
+
+          ## Command line
+
+          The attached archives hold the \`adblock-webkit-convert\` binary for
+          each target. Needs no runtime dependencies.
+          EOF
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file notes.md \
+            --generate-notes \
+            artifacts/*
