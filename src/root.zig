@@ -55,6 +55,9 @@ pub const Options = struct {
     user_agent: []const u8 = "adblock-webkit-convert/0.1",
     /// Attempts per download, counting the first.
     attempts: u8 = 3,
+    download_timeout: std.Io.Timeout = .{
+        .duration = .{ .raw = .fromSeconds(60), .clock = .awake },
+    },
     /// Largest filter list accepted, in bytes.
     max_source_bytes: usize = 32 << 20,
     on_progress: ?*const fn (context: ?*anyopaque, index: usize, result: *const Result) void = null,
@@ -162,9 +165,23 @@ pub fn convertAll(
     for (mappings, results, 0..) |mapping, *result, index| {
         try one(gpa, io, arena.allocator(), mapping, options, result);
         if (options.on_progress) |report| report(options.context, index, result);
+        if (givenUp(result.*)) {
+            for (results[index + 1 ..]) |*rest| rest.* = giving_up;
+            break;
+        }
     }
 
     return .{ .arena = arena, .results = results };
+}
+
+const giving_up: Result = .{
+    .outcome = .failed,
+    .failure = .{ .stage = .download, .err = error.Canceled },
+};
+
+fn givenUp(result: Result) bool {
+    const failure = result.failure orelse return false;
+    return failure.err == error.Canceled;
 }
 
 pub fn convertOne(
@@ -209,6 +226,7 @@ fn one(
                 .user_agent = options.user_agent,
                 .attempts = options.attempts,
                 .max_bytes = options.max_source_bytes,
+                .timeout = options.download_timeout,
             }) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 result.* = .{ .outcome = .failed, .failure = .{ .stage = .download, .err = err } };
