@@ -155,7 +155,6 @@ fn readFailure(request: *std.http.Client.Request) Error {
     const connection = request.connection orelse return error.RequestFailed;
     return switch (connection.stream_reader.err orelse return error.RequestFailed) {
         error.Canceled => error.Canceled,
-        error.Timeout => error.Timeout,
         else => error.RequestFailed,
     };
 }

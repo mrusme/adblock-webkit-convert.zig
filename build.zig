@@ -33,7 +33,11 @@ pub fn build(b: *std.Build) void {
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run.addArgs(args);
+    if (@hasDecl(std.Build.Step.Run, "addPassthruArgs")) {
+        run.addPassthruArgs();
+    } else if (@hasField(std.Build, "args")) {
+        if (b.args) |args| run.addArgs(args);
+    }
     b.step("run", "Build and run the converter").dependOn(&run.step);
 
     const unit_tests = b.addTest(.{ .root_module = module });

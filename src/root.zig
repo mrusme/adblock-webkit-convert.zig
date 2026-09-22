@@ -105,7 +105,7 @@ pub const Stats = struct {
     duplicates: usize = 0,
     skipped: [reason_count]usize = @splat(0),
 
-    const reason_count = @typeInfo(SkipReason).@"enum".fields.len;
+    const reason_count = std.enums.values(SkipReason).len;
 
     pub fn skips(self: Stats, reason: SkipReason) usize {
         return self.skipped[@intFromEnum(reason)];
