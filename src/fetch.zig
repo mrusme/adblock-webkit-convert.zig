@@ -162,24 +162,16 @@ fn readFailure(request: *std.http.Client.Request) Error {
 
 const testing = std.testing;
 
-fn listenLocally(port: *u16) !std.Io.net.Server {
-    var candidate: u16 = 49731;
-    while (candidate < 49771) : (candidate += 1) {
-        const address = std.Io.net.IpAddress.parseIp4("127.0.0.1", candidate) catch unreachable;
-        const server = address.listen(testing.io, .{ .kernel_backlog = 8 }) catch continue;
-        port.* = candidate;
-        return server;
-    }
-    return error.NoFreePort;
-}
-
 test "a download gives up on a server that accepts and never answers" {
-    var port: u16 = undefined;
-    var server = try listenLocally(&port);
+    // Use port 0 to let the operating system pick, because a fixed port is
+    // denied on Windows whenever it is inside one of the ranges Hyper-V has
+    // reserved.
+    const address = std.Io.net.IpAddress.parseIp4("127.0.0.1", 0) catch unreachable;
+    var server = try address.listen(testing.io, .{ .kernel_backlog = 8 });
     defer server.deinit(testing.io);
 
     var url_buffer: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buffer, "http://127.0.0.1:{d}/list.txt", .{port});
+    const url = try std.fmt.bufPrint(&url_buffer, "http://127.0.0.1:{d}/list.txt", .{server.socket.address.getPort()});
 
     const started: std.Io.Timestamp = .now(testing.io, .awake);
     try testing.expectError(error.Timeout, download(testing.allocator, testing.io, url, .{
